@@ -1,7 +1,12 @@
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::convert::{TryFrom, TryInto};
+use std::fmt;
+use std::time::Duration;
 
-use anyhow::{format_err, Result};
+use anyhow::{format_err, Context, Result};
+use futures::future::join_all;
+use log::error;
 use maplit::hashmap;
 
 #[derive(Debug, PartialEq)]
@@ -111,42 +116,115 @@ impl TryFrom<&metar::Metar<'_>> for FlightRules {
     }
 }
 
+#[derive(Debug)]
+enum FlightRulesColor {
+    Purple,
+    Red,
+    Blue,
+    Green,
+}
+
+impl From<FlightRules> for FlightRulesColor {
+    fn from(rules: FlightRules) -> Self {
+        match rules {
+            FlightRules::LowIfr => FlightRulesColor::Purple,
+            FlightRules::Ifr => FlightRulesColor::Red,
+            FlightRules::MarginalVfr => FlightRulesColor::Blue,
+            FlightRules::Vfr => FlightRulesColor::Green,
+        }
+    }
+}
+
+impl fmt::Display for FlightRulesColor {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                FlightRulesColor::Purple => "p",
+                FlightRulesColor::Red => "r",
+                FlightRulesColor::Blue => "b",
+                FlightRulesColor::Green => "g",
+            }
+        )
+    }
+}
+
+struct ColorAndPort {
+    color: FlightRulesColor,
+    port: u16,
+}
+
+async fn flight_rules_color_for_airport(airport: &str, port: u16) -> Result<ColorAndPort> {
+    let res = reqwest::get(&format!(
+        "https://tgftp.nws.noaa.gov/data/observations/metar/stations/{}.TXT",
+        airport
+    ))
+    .await
+    .with_context(|| format_err!("failed to fetch METAR for {}", airport))?;
+
+    let body = res.text().await.with_context(|| {
+        format_err!(
+            "failed to get HTTP response text for METAR request for {}",
+            airport
+        )
+    })?;
+
+    let mut lines = body.lines();
+    lines.next();
+
+    let r = metar::Metar::parse(
+        &lines
+            .next()
+            .ok_or_else(|| format_err!("missing METAR line for {}", airport))?,
+    )
+    .map_err(|e| format_err!("failed to parse METAR for {}: {}", airport, e))?;
+
+    let rules: FlightRules = (&r)
+        .try_into()
+        .with_context(|| format_err!("failed to parse METAR into flight rules for {}", airport))?;
+
+    Ok(ColorAndPort {
+        color: rules.into(),
+        port,
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let port_map = hashmap! {
-        //"KSFO" => 1,
-        //"KSQL" => 2,
-        //"KPAO" => 3,
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+
+    let port_map: HashMap<&str, u16> = hashmap! {
+        "KSFO" => 1,
+        "KSQL" => 2,
+        "KPAO" => 3,
         "KSJC" => 4,
-        "KVUO" => 4,
-        "KHIO" => 4,
-        "KOLM" => 4,
-        "KGRF" => 4,
-        "KPLU" => 4,
+        "KHAF" => 5,
     };
 
+    let mut futures = Vec::new();
     for (airport, port) in port_map {
-        let res = reqwest::get(&format!(
-            "https://tgftp.nws.noaa.gov/data/observations/metar/stations/{}.TXT",
-            airport
-        ))
-        .await?;
+        futures.push(flight_rules_color_for_airport(airport, port));
+    }
 
-        let body = res.text().await?;
+    let mut port = serialport::new("/dev/ttyACM0", 9_600)
+        .timeout(Duration::from_millis(10))
+        .open()?;
 
-        let mut lines = body.lines();
-        lines.next();
+    for result in join_all(futures).await {
+        let color_and_port = match result {
+            Ok(color) => color,
+            Err(e) => {
+                error!("failed to fetch flight rules, turning LED off: {:#}", e);
+                continue;
+            }
+        };
 
-        let r = metar::Metar::parse(
-            &lines
-                .next()
-                .ok_or_else(|| format_err!("missing METAR line"))?,
-        )
-        .map_err(|e| format_err!("failed to parse METAR: {}", e))?;
-
-        let flight_rules: FlightRules = (&r).try_into()?;
-
-        println!("{}: {:?}", airport, flight_rules);
+        if let Err(e) =
+            port.write(&format!("{}{}", color_and_port.port, color_and_port.color).as_bytes())
+        {
+            error!("failed to write flight rules to microcontroller: {:#}", e);
+        }
     }
 
     Ok(())
