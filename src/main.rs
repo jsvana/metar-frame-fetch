@@ -6,10 +6,10 @@ use std::time::Duration;
 
 use anyhow::{format_err, Context, Result};
 use futures::future::join_all;
-use log::error;
+use log::{debug, error, info};
 use maplit::hashmap;
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum FlightRules {
     LowIfr,
     Ifr,
@@ -184,48 +184,62 @@ async fn flight_rules_color_for_airport(airport: &str, port: u16) -> Result<Colo
         .try_into()
         .with_context(|| format_err!("failed to parse METAR into flight rules for {}", airport))?;
 
+    debug!(
+        "{} is {:?} ({})",
+        airport,
+        &rules,
+        FlightRulesColor::from(rules.clone()),
+    );
+
     Ok(ColorAndPort {
         color: rules.into(),
         port,
     })
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
-
-    let port_map: HashMap<&str, u16> = hashmap! {
-        "KSFO" => 1,
-        "KSQL" => 2,
-        "KPAO" => 3,
-        "KSJC" => 4,
-        "KHAF" => 5,
-    };
-
+async fn set_colors(port_map: &HashMap<&str, u16>) -> Result<()> {
     let mut futures = Vec::new();
     for (airport, port) in port_map {
-        futures.push(flight_rules_color_for_airport(airport, port));
+        futures.push(flight_rules_color_for_airport(airport, *port));
     }
 
     let mut port = serialport::new("/dev/ttyACM0", 9_600)
         .timeout(Duration::from_millis(10))
-        .open()?;
+        .open()
+        .context("failed to open serial device")?;
 
     for result in join_all(futures).await {
-        let color_and_port = match result {
-            Ok(color) => color,
-            Err(e) => {
-                error!("failed to fetch flight rules, turning LED off: {:#}", e);
-                continue;
-            }
-        };
+        let color_and_port = result.context("failed to fetch flight rules")?;
 
-        if let Err(e) =
-            port.write(&format!("{}{}", color_and_port.port, color_and_port.color).as_bytes())
-        {
-            error!("failed to write flight rules to microcontroller: {:#}", e);
-        }
+        port.write(&format!("{}{}", color_and_port.port, color_and_port.color).as_bytes())
+            .context("failed to write flight rules to microcontroller")?;
     }
 
     Ok(())
+}
+
+#[tokio::main]
+async fn main() -> ! {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+
+    let port_map: HashMap<&str, u16> = hashmap! {
+        "KOAK" => 1,
+        "KSFO" => 2,
+        "KHAF" => 3,
+        "KSQL" => 4,
+        "KSJC" => 5,
+    };
+
+    let mut timer = tokio::time::interval(Duration::from_secs(300));
+    timer.tick().await;
+
+    loop {
+        info!("Querying METARs and setting colors");
+
+        if let Err(e) = set_colors(&port_map).await {
+            error!("failed to set colors: {:?}", e);
+        }
+
+        timer.tick().await;
+    }
 }
