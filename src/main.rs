@@ -6,8 +6,33 @@ use std::time::Duration;
 
 use anyhow::{format_err, Context, Result};
 use futures::future::join_all;
+use itertools::Itertools;
 use log::{debug, error, info};
 use maplit::hashmap;
+use structopt::StructOpt;
+
+#[derive(Debug, StructOpt)]
+#[structopt(
+    name = "metar_fetch",
+    about = "Fetches METAR data and sends serial commands to a photo frame"
+)]
+struct Args {
+    /// Serial port for connected Pro Micro
+    #[structopt(long, default_value = "/dev/ttyACM0")]
+    serial_port: String,
+
+    /// Baud rate for serial link to Pro Micro
+    #[structopt(long, default_value = "9600")]
+    baud_rate: u32,
+
+    /// Timeout for serial writes to Pro Micro in milliseconds
+    #[structopt(long, default_value = "500")]
+    serial_timeout_ms: u64,
+
+    /// Interval to refresh METAR data in seconds
+    #[structopt(long, default_value = "300")]
+    refresh_interval_s: u64,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 enum FlightRules {
@@ -197,14 +222,19 @@ async fn flight_rules_color_for_airport(airport: &str, port: u16) -> Result<Colo
     })
 }
 
-async fn set_colors(port_map: &HashMap<&str, u16>) -> Result<()> {
+async fn set_colors(
+    serial_port: &str,
+    baud_rate: u32,
+    serial_port_timeout: Duration,
+    port_map: &HashMap<&str, u16>,
+) -> Result<()> {
     let mut futures = Vec::new();
     for (airport, port) in port_map {
         futures.push(flight_rules_color_for_airport(airport, *port));
     }
 
-    let mut port = serialport::new("/dev/ttyACM0", 9_600)
-        .timeout(Duration::from_millis(10))
+    let mut port = serialport::new(serial_port, baud_rate)
+        .timeout(serial_port_timeout)
         .open()
         .context("failed to open serial device")?;
 
@@ -222,6 +252,9 @@ async fn set_colors(port_map: &HashMap<&str, u16>) -> Result<()> {
 async fn main() -> ! {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
+    let args = Args::from_args();
+    let serial_port_timeout = Duration::from_millis(args.serial_timeout_ms);
+
     let port_map: HashMap<&str, u16> = hashmap! {
         "KOAK" => 1,
         "KSFO" => 2,
@@ -230,13 +263,24 @@ async fn main() -> ! {
         "KSJC" => 5,
     };
 
-    let mut timer = tokio::time::interval(Duration::from_secs(300));
+    for (airport, port) in port_map.iter().sorted_by_key(|i| i.1) {
+        info!("{} on LED{}", airport, port);
+    }
+
+    let mut timer = tokio::time::interval(Duration::from_secs(args.refresh_interval_s));
     timer.tick().await;
 
     loop {
         info!("Querying METARs and setting colors");
 
-        if let Err(e) = set_colors(&port_map).await {
+        if let Err(e) = set_colors(
+            &args.serial_port,
+            args.baud_rate,
+            serial_port_timeout.clone(),
+            &port_map,
+        )
+        .await
+        {
             error!("failed to set colors: {:?}", e);
         }
 
